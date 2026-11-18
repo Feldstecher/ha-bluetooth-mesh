@@ -92,7 +92,7 @@ integration decrypts them and shows what the remote did:
 ```yaml
 esp32_ble_tracker:
   on_ble_advertise:
-    - mac_address: [C6:44:8A:8D:35:19]   # the remote's addresses
+    - mac_address: [AA:BB:CC:DD:EE:FF]   # your remote's address(es)
       then:
         - homeassistant.event:
             event: esphome.bluetooth_mesh_pdu
