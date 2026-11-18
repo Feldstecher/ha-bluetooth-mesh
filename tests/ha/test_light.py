@@ -1844,3 +1844,34 @@ async def test_a_temperature_that_left_stays_shown_when_switching_on_fails(
     await group.async_turn_on(color_temp_kelvin=4000)
 
     assert all(m.is_on is False and m.color_temp_kelvin == 4000 for m in members)
+
+
+# ``homeassistant.update_entity`` reads a lamp back. Nothing polls; it is for a
+# change the integration cannot see, such as a Häfele remote commanding a room
+# (a Häfele proxy forwards none of that traffic to us).
+
+
+async def test_update_entity_reads_the_lamp_back(hass) -> None:
+    light, coordinator = _light()
+    light.hass = hass
+
+    await light.async_update()
+
+    assert ("get_onoff", UNICAST) in coordinator.calls
+    assert light.is_on is True
+
+
+async def test_update_entity_does_not_ask_an_unreachable_mesh(hass) -> None:
+    light, coordinator = _light()
+    light.hass = hass
+    coordinator.available = False
+
+    await light.async_update()
+
+    assert coordinator.calls == []
+
+
+def test_a_lamp_is_still_not_polled() -> None:
+    light, _ = _light()
+
+    assert light.should_poll is False

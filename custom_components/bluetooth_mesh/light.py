@@ -454,6 +454,24 @@ class MeshLight(LightEntity):
             self._refresh_task = None
         await super().async_will_remove_from_hass()
 
+    async def async_update(self) -> None:
+        """Read the lamp back when asked to (``homeassistant.update_entity``).
+
+        Nothing polls: ``should_poll`` stays False. This is for a change the
+        integration cannot see happen. A Häfele remote or wall switch commands
+        a room with Sets to a group address; the lamps obey and tell nobody,
+        and a Häfele proxy forwards none of that traffic to its GATT client
+        (tested 2026-11-18 with the group, and with a reject list that should
+        forward everything: nothing in 120 s). Something outside — an
+        automation fired when an ESPHome proxy sees the remote advertise — can
+        now ask for the lamp to be read again.
+
+        An unreachable mesh is not asked: the answer would be silence, and a
+        read is no reason to start a connection the keep-alive just released.
+        """
+        if self._coordinator.available:
+            await self.async_refresh_state()
+
     async def async_refresh_state(self) -> None:
         """Ask the lamp what it is actually doing and cache the answer.
 
