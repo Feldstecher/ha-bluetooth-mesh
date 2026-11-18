@@ -310,6 +310,8 @@ class _ObservedSetRouter:
         for light in self._control.get(message.dst, ()):
             if observed.exact:
                 light.apply_observed_set(observed)
+                if light.lights_at_unknown_brightness(observed):
+                    self._mark(light, "lightness")
             elif observed.scene is not None:
                 if not light.apply_scene(observed.scene):
                     self._mark(light, "all")
@@ -832,6 +834,21 @@ class MeshLight(LightEntity):
             return
         self.apply_group_state(on, brightness, kelvin)
 
+    def lights_at_unknown_brightness(self, observed: ObservedSet) -> bool:
+        """Whether ``observed`` switched this dimmer on at a brightness we lack.
+
+        A bare Generic OnOff "on" brings a lamp back at its last lightness,
+        which is known if it was ever read while lit -- but not for a lamp
+        that has only been seen off since Home Assistant started, which then
+        showed "on" with no brightness at all (2026-11-18).
+        """
+        return (
+            observed.onoff is True
+            and observed.lightness is None
+            and self.color_mode is not ColorMode.ONOFF
+            and self._brightness is None
+        )
+
     def apply_scene(self, number: int) -> bool:
         """Show scene ``number`` as the export says this lamp stores it.
 
@@ -853,7 +870,11 @@ class MeshLight(LightEntity):
         ``"lightness"`` or ``"temperature"`` reads only that state, for a change
         known to touch nothing else. One read at a time, as
         :meth:`_schedule_refresh`: a full read already queued covers a part.
+        A light the user disabled was never added to Home Assistant: there is
+        nothing to show a read on, and no ``hass`` to run it with.
         """
+        if self.hass is None:
+            return
         if part == "all":
             self._schedule_refresh()
             return
@@ -1177,6 +1198,13 @@ class MeshGroupLight(LightEntity):
         if not drives_brightness:
             if not await self._coordinator.async_set_group_onoff(address, True):
                 self._roll_back(snapshots, kelvin_sent=kelvin)
+                return
+            # Lit at its last lightness, which a lamp only ever seen off since
+            # Home Assistant started has never told us: ask it.
+            bare_on = ObservedSet(onoff=True)
+            for member in self._members:
+                if member.lights_at_unknown_brightness(bare_on):
+                    member.schedule_refresh("lightness")
             return
 
         switched_on = False

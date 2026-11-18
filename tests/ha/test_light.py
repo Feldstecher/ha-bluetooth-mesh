@@ -2068,3 +2068,40 @@ async def test_a_scene_the_export_does_not_describe_is_read_back(hass) -> None:
     await hass.async_block_till_done()
 
     assert sorted({c[1] for c in coordinator.calls if c[0] == "get_onoff"}) == [0x0059, 0x00CE]
+
+
+async def test_switched_on_from_the_remote_an_unread_brightness_is_read(hass) -> None:
+    """Only seen off since start: "on" alone does not say how bright."""
+    added, coordinator = await _setup(hass, _tunable_white_group_network())
+    _, members = _group_and_members(added)
+    for member in members:
+        member.hass = hass
+        member._is_on = False
+    members[1]._brightness = 100  # this one was seen lit before
+    coordinator.lightness = 0x8000
+
+    coordinator.hear(_remote_set(CONTROL_ADDR, "820301" "05"))
+    assert all(m.is_on is True for m in members)
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=2))
+    await hass.async_block_till_done()
+
+    assert [c for c in coordinator.calls if c[0] == "get_lightness"] == [
+        ("get_lightness", members[0]._lightness_unicast)
+    ]
+    assert members[0].brightness == 128
+    assert members[1].brightness == 100
+
+
+async def test_a_bare_group_turn_on_reads_an_unread_brightness(hass) -> None:
+    added, coordinator = await _setup(hass, _tunable_white_group_network())
+    group, members = _group_and_members(added)
+    for member in members:
+        member.hass = hass
+        member._is_on = False
+    coordinator.lightness = 0x8000
+
+    await group.async_turn_on()
+    await hass.async_block_till_done()
+
+    assert ("set_group_onoff", CONTROL_ADDR, True) in coordinator.calls
+    assert all(m.brightness == 128 for m in members)
