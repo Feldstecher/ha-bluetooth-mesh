@@ -133,6 +133,12 @@ class FakeCoordinator:
         self.calls.append(("set_group_lightness", group_address, level_0_1))
         return self.group_link
 
+    async def async_set_group_ctl_temperature(
+        self, temperature_address: int, kelvin: int
+    ) -> bool:
+        self.calls.append(("set_group_ctl_temperature", temperature_address, kelvin))
+        return self.group_link
+
 
 def _fixture_network() -> Network:
     """The fabricated sample network (node 0x000C has 0x1000+0x1300+0x1303)."""
@@ -1624,3 +1630,217 @@ async def test_a_mixed_group_whose_dimming_did_not_leave_stays_lit(hass) -> None
 
     assert all(m.is_on is True for m in members)
     assert dimmer.brightness == 40
+
+
+# A group's colour temperature goes to its CTL-temperature sub-address
+# (``multicastAddress2``), where the app subscribed each lamp's Temperature
+# server element. One Set there recolours every member at once; a Home
+# Assistant light group did it one unicast Set at a time (19 lamps, 5.7 s,
+# observed 2026-11-18 on Häfele Mesh Box TW).
+
+CONTROL_ADDR = 0xC014
+TEMP_ADDR = 0xC015
+
+
+def _tunable_white_box(unicast: int, *, temp_subscribed: bool = True) -> Node:
+    """A Häfele-style tunable-white box: CTL on element 0, Temperature on 1."""
+    return Node(
+        uuid=f"aaaabbbb-cccc-dddd-eeee-ffff0000{unicast:04x}",
+        unicast=unicast,
+        device_key=b"\x00" * 16,
+        cid=0x07E9,
+        name=f"Box {unicast:04x}",
+        elements=(
+            Element(
+                index=0,
+                unicast=unicast,
+                models=tuple(
+                    Model(
+                        model_id=model_id,
+                        bound_appkey_indexes=(0,),
+                        subscribe=(CONTROL_ADDR,),
+                    )
+                    for model_id in (0x1000, 0x1300, 0x1303)
+                ),
+            ),
+            Element(
+                index=1,
+                unicast=unicast + 1,
+                models=(
+                    Model(
+                        model_id=0x1306,
+                        bound_appkey_indexes=(0,),
+                        subscribe=(TEMP_ADDR,) if temp_subscribed else (),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+
+def _tunable_white_group_network(*, second_temp_subscribed: bool = True) -> Network:
+    return replace(
+        _fixture_network(),
+        nodes=(
+            _tunable_white_box(0x0059),
+            _tunable_white_box(0x00CE, temp_subscribed=second_temp_subscribed),
+        ),
+        groups=(
+            Group(
+                id="g1",
+                name="Alles ohne Schübe",
+                kind="group",
+                address=CONTROL_ADDR,
+                temperature_address=TEMP_ADDR,
+            ),
+        ),
+    )
+
+
+async def _setup_options(hass, network, options):
+    coordinator = FakeCoordinator(network)
+    added: list = []
+    await async_setup_entry(
+        hass, _entry(coordinator, options), lambda e: added.extend(e)
+    )
+    for light in added:
+        light.async_write_ha_state = lambda: None  # type: ignore[method-assign]
+    return added, coordinator
+
+
+async def test_a_group_every_member_hears_on_temperature_offers_colour_temp(
+    hass,
+) -> None:
+    added, _ = await _setup(hass, _tunable_white_group_network())
+    group, _ = _group_and_members(added)
+
+    assert group.color_mode == ColorMode.COLOR_TEMP
+    assert group.supported_color_modes == {ColorMode.COLOR_TEMP}
+
+
+async def test_a_group_with_one_member_deaf_on_temperature_only_dims(hass) -> None:
+    """13 of 24 lamps of a room lacked the temperature subscription (2026-11-18):
+    a Set there would recolour some lamps while the group showed one colour."""
+    added, _ = await _setup(
+        hass, _tunable_white_group_network(second_temp_subscribed=False)
+    )
+    group, _ = _group_and_members(added)
+
+    assert group.color_mode == ColorMode.BRIGHTNESS
+
+
+async def test_a_group_without_a_temperature_address_only_dims(hass) -> None:
+    network = _tunable_white_group_network()
+    network = replace(
+        network, groups=(replace(network.groups[0], temperature_address=None),)
+    )
+    added, _ = await _setup(hass, network)
+    group, _ = _group_and_members(added)
+
+    assert group.color_mode == ColorMode.BRIGHTNESS
+
+
+async def test_a_group_with_an_inverted_member_only_dims(hass) -> None:
+    """One Set carries one value; a mirrored lamp would need another."""
+    added, _ = await _setup_options(
+        hass, _tunable_white_group_network(), {CONF_INVERTED_CTL: [0x00CE]}
+    )
+    group, _ = _group_and_members(added)
+
+    assert group.color_mode == ColorMode.BRIGHTNESS
+
+
+async def test_group_colour_temperature_is_one_set_to_the_temperature_address(
+    hass,
+) -> None:
+    added, coordinator = await _setup(hass, _tunable_white_group_network())
+    group, members = _group_and_members(added)
+    for member in members:
+        member._is_on = True
+
+    await group.async_turn_on(color_temp_kelvin=4000)
+
+    # Already lit: the temperature is all that leaves, and no unicast Set.
+    assert coordinator.calls == [("set_group_ctl_temperature", TEMP_ADDR, 4000)]
+    assert all(m.color_temp_kelvin == 4000 for m in members)
+    assert group.color_temp_kelvin == 4000
+
+
+async def test_group_colour_temperature_on_an_unlit_group_also_switches_it_on(
+    hass,
+) -> None:
+    """Temperature first, so the lamps light up at the new colour."""
+    added, coordinator = await _setup(hass, _tunable_white_group_network())
+    group, members = _group_and_members(added)
+
+    await group.async_turn_on(color_temp_kelvin=3000)
+
+    assert coordinator.calls == [
+        ("set_group_ctl_temperature", TEMP_ADDR, 3000),
+        ("set_group_onoff", CONTROL_ADDR, True),
+    ]
+    assert all(m.is_on is True for m in members)
+
+
+async def test_group_brightness_and_temperature_take_two_sets(hass) -> None:
+    added, coordinator = await _setup(hass, _tunable_white_group_network())
+    group, members = _group_and_members(added)
+
+    await group.async_turn_on(brightness=128, color_temp_kelvin=2700)
+
+    assert coordinator.calls == [
+        ("set_group_ctl_temperature", TEMP_ADDR, 2700),
+        ("set_group_lightness", CONTROL_ADDR, pytest.approx(128 / 255, abs=1e-6)),
+    ]
+    assert all(m.brightness == 128 and m.color_temp_kelvin == 2700 for m in members)
+
+
+async def test_group_temperature_range_is_what_every_member_reaches(hass) -> None:
+    added, coordinator = await _setup(hass, _tunable_white_group_network())
+    group, members = _group_and_members(added)
+    members[0]._attr_min_color_temp_kelvin = 2700
+    members[0]._attr_max_color_temp_kelvin = 5000
+    members[1]._attr_min_color_temp_kelvin = 3000
+    members[1]._attr_max_color_temp_kelvin = 6500
+    for member in members:
+        member._is_on = True
+
+    assert (group.min_color_temp_kelvin, group.max_color_temp_kelvin) == (3000, 5000)
+
+    await group.async_turn_on(color_temp_kelvin=6500)
+
+    assert coordinator.calls == [("set_group_ctl_temperature", TEMP_ADDR, 5000)]
+
+
+async def test_a_group_temperature_that_never_left_puts_the_members_back(
+    hass,
+) -> None:
+    added, coordinator = await _setup(hass, _tunable_white_group_network())
+    group, members = _group_and_members(added)
+    for member in members:
+        member._is_on, member._color_temp_kelvin = True, 2700
+    coordinator.group_link = False
+
+    await group.async_turn_on(color_temp_kelvin=5000)
+
+    assert all(m.color_temp_kelvin == 2700 and m.is_on is True for m in members)
+
+
+async def test_a_temperature_that_left_stays_shown_when_switching_on_fails(
+    hass,
+) -> None:
+    """The lamps took the colour; only the on-state the OnOff carried goes back."""
+    added, coordinator = await _setup(hass, _tunable_white_group_network())
+    group, members = _group_and_members(added)
+    for member in members:
+        member._is_on, member._color_temp_kelvin = False, 2700
+
+    async def onoff_fails(group_address, on):
+        coordinator.calls.append(("set_group_onoff", group_address, on))
+        return False
+
+    coordinator.async_set_group_onoff = onoff_fails  # type: ignore[method-assign]
+
+    await group.async_turn_on(color_temp_kelvin=4000)
+
+    assert all(m.is_on is False and m.color_temp_kelvin == 4000 for m in members)

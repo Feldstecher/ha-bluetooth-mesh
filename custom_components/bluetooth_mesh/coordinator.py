@@ -1321,6 +1321,21 @@ class MeshCoordinator:
 
         return bool(await self._run_connected(send))
 
+    async def async_set_group_ctl_temperature(
+        self, temperature_address: int, kelvin: int
+    ) -> bool:
+        """Set Light CTL Temperature (K) on a group's temperature sub-address.
+
+        Unacknowledged; returns whether the Set left, as
+        :meth:`async_set_group_onoff` does.
+        """
+
+        async def send(controller) -> bool:
+            await controller.set_group_ctl_temperature(temperature_address, kelvin)
+            return not controller.failed
+
+        return bool(await self._run_connected(send))
+
     async def async_set_ctl(
         self, unicast: int, level_0_1: float, kelvin: int
     ) -> int | None:

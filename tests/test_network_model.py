@@ -497,3 +497,34 @@ def test_groups_defaults_to_empty_without_tos_groups():
     network = Network.from_connect(_doc([_GOOD_NODE]))
 
     assert network.groups == ()
+
+
+def test_group_temperature_address_is_the_second_multicast_address():
+    doc = _doc([_GOOD_NODE])
+    doc["tos_groups"] = [
+        {
+            "id": "AAA",
+            "type": "group",
+            "name": "Alles ohne Schübe",
+            "multicastAddress": 0xC014,
+            "multicastAddress2": 0xC015,
+            "multicastAddress3": 0xC016,
+            "multicastAddress4": 0xC017,
+        },
+        {"id": "BBB", "type": "room", "name": "Diele", "multicastAddress": 49183},
+        {
+            "id": "CCC",
+            "type": "group",
+            "name": "Kaputt",
+            "multicastAddress": 0xC020,
+            "multicastAddress2": "C021",
+        },
+    ]
+
+    network = Network.from_connect(doc)
+
+    assert [(g.name, g.temperature_address) for g in network.groups] == [
+        ("Alles ohne Schübe", 0xC015),
+        ("Diele", None),
+        ("Kaputt", None),
+    ]

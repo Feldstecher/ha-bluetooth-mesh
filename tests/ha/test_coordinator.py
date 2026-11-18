@@ -139,6 +139,11 @@ class FakeController:
         self.seq += 1
         self.tid = (self.tid + 1) & 0xFF
 
+    async def set_group_ctl_temperature(self, group_address: int, kelvin: int) -> None:
+        self.calls.append(("set_group_ctl_temperature", group_address, kelvin))
+        self.seq += 1
+        self.tid = (self.tid + 1) & 0xFF
+
 
 def _make_entry(hass) -> MockConfigEntry:
     """A config entry carrying the sanitized sample .connect JSON."""
@@ -261,6 +266,20 @@ async def test_async_set_group_lightness_sends_unacknowledged(hass) -> None:
 
         assert result is True
         assert fake.calls[-1] == ("set_group_lightness", 0xC028, 1.0)
+    await coord.async_stop()
+
+
+async def test_async_set_group_ctl_temperature_sends_unacknowledged(hass) -> None:
+    entry = _make_entry(hass)
+    fake = FakeController()
+    with _patch_transport(fake):
+        coord = MeshCoordinator(hass, entry)
+        await coord.async_start()
+
+        result = await coord.async_set_group_ctl_temperature(0xC015, 4000)
+
+        assert result is True
+        assert fake.calls[-1] == ("set_group_ctl_temperature", 0xC015, 4000)
     await coord.async_stop()
 
 

@@ -490,6 +490,23 @@ class MeshController:
         self._node.send_access(group_address, payload)
         await self._pump.flush()
 
+    async def set_group_ctl_temperature(self, group_address: int, kelvin: int) -> None:
+        """Set Light CTL Temperature on a mesh group address — fire-and-forget.
+
+        ``group_address`` must be the group's CTL-temperature sub-address
+        (:attr:`btmesh.network_model.Group.temperature_address`), not its
+        control address: the Temperature server that answers this opcode sits
+        on its own element, and that element is what the app subscribed. Like
+        the unicast Temperature Set, it does not switch a lamp on. See
+        :meth:`set_group_onoff` for why this is unacknowledged.
+        """
+        temperature = min(_CTL_TEMP_MAX, max(_CTL_TEMP_MIN, kelvin))
+        payload = light_ctl_temperature_set(
+            temperature, 0, self._next_tid(), ack=False
+        )
+        self._node.send_access(group_address, payload)
+        await self._pump.flush()
+
     async def set_ctl(
         self, unicast: int, level_0_1: float, kelvin: int, *, timeout: float = 5.0
     ) -> int | None:

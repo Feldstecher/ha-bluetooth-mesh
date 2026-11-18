@@ -28,6 +28,7 @@ from btmesh.access import (
     OP_LIGHT_CTL_TEMPERATURE_RANGE_GET,
     OP_LIGHT_CTL_TEMPERATURE_RANGE_STATUS,
     OP_LIGHT_CTL_TEMPERATURE_SET,
+    OP_LIGHT_CTL_TEMPERATURE_SET_UNACK,
     OP_LIGHT_CTL_TEMPERATURE_STATUS,
     OP_LIGHT_LIGHTNESS_GET,
     OP_LIGHT_LIGHTNESS_SET,
@@ -1041,5 +1042,32 @@ async def test_a_late_subscribe_failure_marks_the_controller_failed():
         bearer.failure = RuntimeError("Insufficient authorization (8)")
         assert controller.failed is True
         assert isinstance(controller.failure, RuntimeError)
+    finally:
+        await controller.stop()
+
+
+TEMP_GROUP = 0xC015
+
+
+async def test_set_group_ctl_temperature_emits_unacknowledged_set():
+    controller, _, captured = make_setup()
+    await controller.start()
+    try:
+        await controller.set_group_ctl_temperature(TEMP_GROUP, 4000)
+    finally:
+        await controller.stop()
+    assert captured[-1].opcode == OP_LIGHT_CTL_TEMPERATURE_SET_UNACK
+    assert int.from_bytes(captured[-1].params[0:2], "little") == 4000
+    assert int.from_bytes(captured[-1].params[2:4], "little", signed=True) == 0
+
+
+async def test_set_group_ctl_temperature_clamps_to_the_model_range():
+    controller, _, captured = make_setup()
+    await controller.start()
+    try:
+        await controller.set_group_ctl_temperature(TEMP_GROUP, 100)
+        assert int.from_bytes(captured[-1].params[0:2], "little") == 800
+        await controller.set_group_ctl_temperature(TEMP_GROUP, 99999)
+        assert int.from_bytes(captured[-1].params[0:2], "little") == 20000
     finally:
         await controller.stop()

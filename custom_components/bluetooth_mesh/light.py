@@ -148,6 +148,42 @@ def _element_subscribes(element, address: int) -> bool:
     return any(address in model.subscribe for model in element.models)
 
 
+def _group_temperature_address(group, members) -> int | None:
+    """The group's temperature sub-address, if one Set there reaches every member.
+
+    One Light CTL Temperature Set to that address moves every lamp whose
+    Temperature server subscribes to it, at the same instant — where a Home
+    Assistant light group walks its members one unicast Set at a time, about a
+    third of a second each (19 lamps took 5.7 s on 2026-11-18).
+
+    ``None``, leaving the group to brightness only, unless EVERY member:
+
+    * is tunable white and has a Temperature server element. One that has no
+      such element is reached only through Light CTL Set, which carries a
+      lightness and so cannot change colour alone;
+    * has that element subscribed to the sub-address. The app does not always
+      write it: in an export of 2026-11-18, 13 of a room's 24 lamps had the
+      control address but not the temperature one. A group Set there would
+      recolour 11 lamps and leave 13 as they were, while the group showed one
+      colour for all;
+    * is not marked as mapping temperature inversely. One Set carries one
+      value, and a mirrored lamp needs a different one from its neighbours.
+    """
+    address = group.temperature_address
+    if address is None:
+        return None
+    for member in members:
+        element = member.ctl_temp_element
+        if (
+            member.color_mode is not ColorMode.COLOR_TEMP
+            or member.inverts_ctl
+            or element is None
+            or not _element_subscribes(element, address)
+        ):
+            return None
+    return address
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: BluetoothMeshConfigEntry,
@@ -197,7 +233,14 @@ async def async_setup_entry(
         # A "group" of fewer than two members controls nothing a direct
         # entity does not already: one message, one lamp, no loop to avoid.
         if len(members) >= 2:
-            entities.append(MeshGroupLight(coordinator, group, members))
+            entities.append(
+                MeshGroupLight(
+                    coordinator,
+                    group,
+                    members,
+                    temperature_address=_group_temperature_address(group, members),
+                )
+            )
 
     async_add_entities(entities)
 
@@ -313,6 +356,10 @@ class MeshLight(LightEntity):
         self._ctl_temp_unicast = (
             temp_element.unicast if temp_element is not None else None
         )
+        # Kept whole, not just its address: a group can only carry a colour
+        # temperature if this element subscribes to the group's temperature
+        # sub-address (see :func:`_group_temperature_address`).
+        self._ctl_temp_element = temp_element
 
         # Optimistic cache. ``None`` means "not known yet" — never claim a state
         # that has not been commanded or read (see the ``is_on`` property).
@@ -491,6 +538,16 @@ class MeshLight(LightEntity):
     def color_temp_kelvin(self) -> int | None:
         return self._color_temp_kelvin
 
+    @property
+    def ctl_temp_element(self):
+        """The element hosting this light's Light CTL Temperature server, or None."""
+        return self._ctl_temp_element
+
+    @property
+    def inverts_ctl(self) -> bool:
+        """Whether this lamp is marked as mapping colour temperature inversely."""
+        return self._invert_ctl
+
     # ---------------------------------------------------------------- helpers
 
     @staticmethod
@@ -604,7 +661,9 @@ class MeshLight(LightEntity):
                 "on" if requested else "off",
             )
 
-    def apply_group_state(self, on: bool, brightness: int | None) -> None:
+    def apply_group_state(
+        self, on: bool, brightness: int | None, kelvin: int | None = None
+    ) -> None:
         """Reflect a :class:`MeshGroupLight` command sent on this entity's behalf.
 
         A group Set is one unacknowledged message to every subscribed element
@@ -613,19 +672,29 @@ class MeshLight(LightEntity):
         entity pushes the same intent here directly instead of this entity
         sending its own unicast command (which is exactly the sequential
         round trip ha-bluetooth-mesh#33 exists to avoid).
+
+        ``kelvin`` is clamped to this lamp's own range: the group sends one
+        value to every member, and a lamp asked for more than it tracks
+        settles on its limit, which is what it would report if read back.
         """
         self._is_on = on
         if brightness is not None:
             self._brightness = brightness
+        if kelvin is not None:
+            self._color_temp_kelvin = min(
+                self.max_color_temp_kelvin, max(self.min_color_temp_kelvin, kelvin)
+            )
         self._write_state()
 
-    def group_snapshot(self) -> tuple[bool | None, int | None]:
+    def group_snapshot(self) -> tuple[bool | None, int | None, int | None]:
         """What this light shows, so a group can put it back."""
-        return self._is_on, self._brightness
+        return self._is_on, self._brightness, self._color_temp_kelvin
 
-    def restore_group_snapshot(self, snapshot: tuple[bool | None, int | None]) -> None:
+    def restore_group_snapshot(
+        self, snapshot: tuple[bool | None, int | None, int | None]
+    ) -> None:
         """Undo :meth:`apply_group_state` for a group Set that never left."""
-        self._is_on, self._brightness = snapshot
+        self._is_on, self._brightness, self._color_temp_kelvin = snapshot
         self._write_state()
 
     async def async_turn_on(self, **kwargs) -> None:
@@ -753,19 +822,28 @@ class MeshGroupLight(LightEntity):
         coordinator: MeshCoordinator,
         group,
         members: tuple[MeshLight, ...],
+        *,
+        temperature_address: int | None = None,
     ) -> None:
+        """``temperature_address`` is given only when one Set there reaches
+        every member (see :func:`_group_temperature_address`); without it the
+        group dims but carries no colour temperature."""
         self._coordinator = coordinator
         self._group = group
         self._members = members
+        self._temperature_address = temperature_address
         self._attr_unique_id = (
             f"{coordinator.network.identifier}_group_{group.address:04x}"
         )
         self._attr_name = group.name or f"Group {group.address:04x}"
 
-        # Brightness only if at least one member can dim — CTL/colour groups
-        # are not modelled yet (see ha-bluetooth-mesh#33): a group send only
-        # covers Generic OnOff and Light Lightness so far.
-        if any(m.color_mode in (ColorMode.BRIGHTNESS, ColorMode.COLOR_TEMP) for m in members):
+        # Colour temperature only where every member can take it from one Set;
+        # otherwise brightness if at least one member can dim.
+        if temperature_address is not None:
+            mode = ColorMode.COLOR_TEMP
+        elif any(
+            m.color_mode in (ColorMode.BRIGHTNESS, ColorMode.COLOR_TEMP) for m in members
+        ):
             mode = ColorMode.BRIGHTNESS
         else:
             mode = ColorMode.ONOFF
@@ -803,7 +881,37 @@ class MeshGroupLight(LightEntity):
             return None
         return round(sum(lit) / len(lit))
 
-    def _push_to_members(self, on: bool, brightness: int | None) -> list:
+    @property
+    def color_temp_kelvin(self) -> int | None:
+        """The lit members' average, as :attr:`brightness` is: derived, not kept."""
+        if self._temperature_address is None:
+            return None
+        lit = [
+            m.color_temp_kelvin
+            for m in self._members
+            if m.is_on and m.color_temp_kelvin is not None
+        ]
+        if not lit:
+            return None
+        return round(sum(lit) / len(lit))
+
+    @property
+    def min_color_temp_kelvin(self) -> int:
+        """The warmest value EVERY member can reach.
+
+        Each member's range is replaced by the lamp's own the first time it is
+        read, so this is computed per call rather than fixed at construction.
+        """
+        return max(m.min_color_temp_kelvin for m in self._members)
+
+    @property
+    def max_color_temp_kelvin(self) -> int:
+        """The coolest value every member can reach (see the minimum)."""
+        return min(m.max_color_temp_kelvin for m in self._members)
+
+    def _push_to_members(
+        self, on: bool, brightness: int | None, kelvin: int | None = None
+    ) -> list:
         """Show the command on every member at once; return what they showed.
 
         A member that cannot dim is only ever told on or off: pushing a
@@ -812,14 +920,23 @@ class MeshGroupLight(LightEntity):
         snapshots = [member.group_snapshot() for member in self._members]
         for member in self._members:
             member.apply_group_state(
-                on, brightness if member.color_mode is not ColorMode.ONOFF else None
+                on,
+                brightness if member.color_mode is not ColorMode.ONOFF else None,
+                kelvin,
             )
         return snapshots
 
-    def _roll_back(self, snapshots: list) -> None:
-        """Put every member back: the Set never left, so no lamp changed."""
+    def _roll_back(self, snapshots: list, *, kelvin_sent: int | None = None) -> None:
+        """Put every member back: the Set never left, so no lamp changed.
+
+        ``kelvin_sent`` is a temperature Set that DID leave before a later one
+        failed. The lamps took it, so it stays shown while on and brightness
+        go back.
+        """
         for member, snapshot in zip(self._members, snapshots, strict=True):
             member.restore_group_snapshot(snapshot)
+            if kelvin_sent is not None:
+                member.apply_group_state(snapshot[0], None, kelvin_sent)
 
     async def async_turn_on(self, **kwargs) -> None:
         """Switch the group on, in as few unacknowledged Sets as it takes.
@@ -830,31 +947,51 @@ class MeshGroupLight(LightEntity):
         OnOff Set, and it goes FIRST. The other way round, a dimmer already lit
         by the lightness would apply OnOff's own rule on top of it and jump to
         its default lightness, undoing the brightness just asked for.
+
+        A colour temperature goes before either, to the group's temperature
+        sub-address. It does not switch a lamp on, so lamps that were off light
+        up below already at the new colour instead of flashing the old one; a
+        temperature-only change of a group whose members are all lit sends
+        nothing else.
         """
-        drives_brightness = (
-            ATTR_BRIGHTNESS in kwargs and self._attr_color_mode is ColorMode.BRIGHTNESS
-        )
+        dims = self._attr_color_mode in (ColorMode.BRIGHTNESS, ColorMode.COLOR_TEMP)
+        drives_brightness = ATTR_BRIGHTNESS in kwargs and dims
+        kelvin = None
+        if self._temperature_address is not None and ATTR_COLOR_TEMP_KELVIN in kwargs:
+            kelvin = min(
+                self.max_color_temp_kelvin,
+                max(self.min_color_temp_kelvin, kwargs[ATTR_COLOR_TEMP_KELVIN]),
+            )
         snapshots = self._push_to_members(
-            True, kwargs[ATTR_BRIGHTNESS] if drives_brightness else None
+            True, kwargs[ATTR_BRIGHTNESS] if drives_brightness else None, kelvin
         )
+
+        if kelvin is not None:
+            if not await self._coordinator.async_set_group_ctl_temperature(
+                self._temperature_address, kelvin
+            ):
+                self._roll_back(snapshots)
+                return
+            if not drives_brightness and all(snapshot[0] for snapshot in snapshots):
+                return
 
         address = self._group.address
         if not drives_brightness:
             if not await self._coordinator.async_set_group_onoff(address, True):
-                self._roll_back(snapshots)
+                self._roll_back(snapshots, kelvin_sent=kelvin)
             return
 
         switched_on = False
         if any(m.color_mode is ColorMode.ONOFF for m in self._members):
             switched_on = await self._coordinator.async_set_group_onoff(address, True)
             if not switched_on:
-                self._roll_back(snapshots)
+                self._roll_back(snapshots, kelvin_sent=kelvin)
                 return
         if not await self._coordinator.async_set_group_lightness(
             address, MeshLight._brightness_to_level(kwargs[ATTR_BRIGHTNESS])
         ):
             # Nothing was dimmed; the OnOff that did leave still lit them all.
-            self._roll_back(snapshots)
+            self._roll_back(snapshots, kelvin_sent=kelvin)
             if switched_on:
                 self._push_to_members(True, None)
 

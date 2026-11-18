@@ -163,16 +163,23 @@ class Group:
     not configure that subscription itself — see ha-bluetooth-mesh#33 — it
     only reads what the app already wrote.
 
-    Only the Generic OnOff / Light Lightness control address is modelled
-    (``multicastAddress`` in the export); the CTL-temperature and HSL
-    sub-addresses (``multicastAddress2..4``) are unused until a group needs to
-    carry colour.
+    ``address`` is the control address (``multicastAddress`` in the export),
+    which the Generic OnOff, Light Lightness and Light CTL servers subscribe
+    to. ``temperature_address`` is the CTL-temperature sub-address
+    (``multicastAddress2``): the app subscribes each lamp's Light CTL
+    Temperature server — which sits on its own element — to it, not to the
+    control address, so a temperature sent to ``address`` reaches no lamp.
+    ``None`` when the export carries none. The HSL sub-addresses
+    (``multicastAddress3..4``) are not modelled: no lamp seen here has an HSL
+    server.
     """
 
     id: str
     name: str
     kind: str
     address: int
+    # Defaulted so a Group built by hand (tests, fixtures) stays valid.
+    temperature_address: int | None = None
 
 
 @dataclass(frozen=True)
@@ -417,12 +424,20 @@ def _parse_groups(entries: object) -> tuple[Group, ...]:
             continue
         if isinstance(address, bool) or not isinstance(address, int):
             continue
+        # Optional: a group without it still switches and dims, it only
+        # cannot carry a colour temperature in one message.
+        temperature_address = entry.get("multicastAddress2")
+        if isinstance(temperature_address, bool) or not isinstance(
+            temperature_address, int
+        ):
+            temperature_address = None
         groups.append(
             Group(
                 id=str(entry.get("id", "")),
                 name=name,
                 kind=str(entry.get("type", "")),
                 address=address,
+                temperature_address=temperature_address,
             )
         )
     return tuple(groups)
