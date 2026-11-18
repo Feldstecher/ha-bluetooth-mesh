@@ -548,7 +548,7 @@ def test_parse_light_ctl_temperature_range_status_rejects_a_wrong_length():
         # Generic Delta Set Unack: amount unknown here
         ("820a" "00100000" "0b", ObservedSet(exact=False)),
         # Scene Recall Unack, scene 1
-        ("8243" "0100" "0c", ObservedSet(exact=False)),
+        ("8243" "0100" "0c", ObservedSet(scene=1, exact=False)),
     ],
 )
 def test_observe_set_reads_the_state_a_set_implies(payload, expected):

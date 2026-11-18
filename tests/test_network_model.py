@@ -16,6 +16,7 @@ from btmesh.network_model import (
     Network,
     NetworkModelError,
     Node,
+    SceneState,
 )
 
 FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures", "sample.connect.json")
@@ -528,3 +529,36 @@ def test_group_temperature_address_is_the_second_multicast_address():
         ("Diele", None),
         ("Kaputt", None),
     ]
+
+
+
+def test_scenes_are_read_from_the_devices_and_kept_only_where_they_agree():
+    doc = _doc([_GOOD_NODE])
+    doc["tos_scenes"] = [
+        {"id": "S1", "sceneNumber": 1},
+        {"id": "S2", "sceneNumber": 2},
+        {"id": "S3", "sceneNumber": 3},
+        {"id": "bad"},
+    ]
+    doc["nodes"][0]["tos_devices"] = [
+        {"sceneSettings": [
+            {"id": "S1", "sceneValue": [65535, 5000, 0]},
+            {"id": "S2", "sceneValue": [19661, 2700, 0]},
+            {"id": "S3", "sceneValue": [100, 3000]},
+        ]},
+        {"sceneSettings": [
+            {"id": "S1", "sceneValue": [65535, 5000, 0]},
+            {"id": "S2", "sceneValue": [3277, 3000, 0]},  # disagrees: dropped
+            {"id": "bad", "sceneValue": [1, 2]},  # no number: skipped
+            {"id": "S3", "sceneValue": "junk"},
+        ]},
+    ]
+
+    node = Network.from_connect(doc).nodes[0]
+
+    assert node.scenes == (
+        SceneState(number=1, lightness=65535, temperature=5000),
+        SceneState(number=3, lightness=100, temperature=3000),
+    )
+    assert node.scene(1).temperature == 5000
+    assert node.scene(2) is None

@@ -59,10 +59,11 @@ from .coordinator import MeshCoordinator
 logger = logging.getLogger(__name__)
 
 # How long after the last Set that left a lamp's state unknown (a dimming
-# wheel's Level deltas, a scene recall) the lamps it reached are read back.
+# wheel's Level moves, a scene the export does not describe) the lamps it
+# reached are read back.
 # A wheel turned sends one delta after another; reading after each would queue
 # a read of every lamp in the room behind every step.
-OBSERVED_REFRESH_DELAY = 1.5
+OBSERVED_REFRESH_DELAY = 1.0
 
 # HA brightness is a 0..255 byte; mesh Lightness/CTL are 16-bit 0..65535.
 MESH_LEVEL_MAX = 0xFFFF
@@ -293,7 +294,8 @@ class _ObservedSetRouter:
         self._hass = hass
         self._control = control
         self._temperature = temperature
-        self._stale: set[MeshLight] = set()
+        # What to read back on each light: "lightness", "temperature" or "all".
+        self._stale: dict[MeshLight, str] = {}
         self._cancel_refresh: CALLBACK_TYPE | None = None
 
     @callback
@@ -308,27 +310,37 @@ class _ObservedSetRouter:
         for light in self._control.get(message.dst, ()):
             if observed.exact:
                 light.apply_observed_set(observed)
+            elif observed.scene is not None:
+                if not light.apply_scene(observed.scene):
+                    self._mark(light, "all")
             else:
-                self._stale.add(light)
+                # A Level move or delta on the control address moves the
+                # lightness only; reading just that is a third of the round trips.
+                self._mark(light, "lightness")
         for light in self._temperature.get(message.dst, ()):
             # A Temperature element reads a Level Set as a temperature, not a
             # lightness, so only a Set that names a temperature is exact here.
             if observed.exact and observed.temperature is not None:
                 light.apply_observed_set(ObservedSet(temperature=observed.temperature))
             else:
-                self._stale.add(light)
+                self._mark(light, "temperature")
         if self._stale:
             self.async_cancel()
             self._cancel_refresh = async_call_later(
                 self._hass, OBSERVED_REFRESH_DELAY, self._refresh
             )
 
+    def _mark(self, light: MeshLight, part: str) -> None:
+        """Remember what to read on ``light``; two different parts make all."""
+        known = self._stale.get(light)
+        self._stale[light] = part if known in (None, part) else "all"
+
     @callback
     def _refresh(self, _now) -> None:
         self._cancel_refresh = None
-        stale, self._stale = self._stale, set()
-        for light in stale:
-            light.schedule_refresh()
+        stale, self._stale = self._stale, {}
+        for light, part in stale.items():
+            light.schedule_refresh(part)
 
     @callback
     def async_cancel(self) -> None:
@@ -452,6 +464,8 @@ class MeshLight(LightEntity):
         # temperature if this element subscribes to the group's temperature
         # sub-address (see :func:`_group_temperature_address`).
         self._ctl_temp_element = temp_element
+        # What this lamp shows for each scene the vendor app stored on it.
+        self._scenes = {scene.number: scene for scene in node.scenes}
 
         # Optimistic cache. ``None`` means "not known yet" — never claim a state
         # that has not been commanded or read (see the ``is_on`` property).
@@ -818,9 +832,57 @@ class MeshLight(LightEntity):
             return
         self.apply_group_state(on, brightness, kelvin)
 
-    def schedule_refresh(self) -> None:
-        """Read the lamp back in the background (see :meth:`_schedule_refresh`)."""
-        self._schedule_refresh()
+    def apply_scene(self, number: int) -> bool:
+        """Show scene ``number`` as the export says this lamp stores it.
+
+        False when the export names no such scene for this node, so the caller
+        reads the lamp back instead. A stored lightness of 0 is a scene that
+        switches the lamp off.
+        """
+        scene = self._scenes.get(number)
+        if scene is None:
+            return False
+        self.apply_observed_set(
+            ObservedSet(lightness=scene.lightness, temperature=scene.temperature)
+        )
+        return True
+
+    def schedule_refresh(self, part: str = "all") -> None:
+        """Read the lamp back in the background: everything, or one ``part``.
+
+        ``"lightness"`` or ``"temperature"`` reads only that state, for a change
+        known to touch nothing else. One read at a time, as
+        :meth:`_schedule_refresh`: a full read already queued covers a part.
+        """
+        if part == "all":
+            self._schedule_refresh()
+            return
+        if self._refresh_task is not None and not self._refresh_task.done():
+            return
+        self._refresh_task = self.hass.async_create_background_task(
+            self._async_refresh_part(part),
+            f"bluetooth_mesh refresh {part} {self._unicast:04x}",
+        )
+
+    async def _async_refresh_part(self, part: str) -> None:
+        if part == "temperature":
+            if self._attr_color_mode is not ColorMode.COLOR_TEMP:
+                return
+            await self._refresh_ctl()
+        elif self._attr_color_mode is ColorMode.ONOFF:
+            on = await self._coordinator.async_get_onoff(self._onoff_unicast)
+            if on is None:
+                return
+            self._is_on = on
+        else:
+            level = await self._coordinator.async_get_lightness(self._lightness_unicast)
+            if level is None:
+                return
+            # Lightness 0 is off; anything else is on, at that brightness.
+            self._is_on = level > 0
+            if level > 0:
+                self._brightness = max(1, self._level_to_brightness(level))
+        self._write_state()
 
     def group_snapshot(self) -> tuple[bool | None, int | None, int | None]:
         """What this light shows, so a group can put it back."""

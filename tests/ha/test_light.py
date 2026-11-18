@@ -35,6 +35,7 @@ from custom_components.bluetooth_mesh.btmesh.network_model import (
     Model,
     Network,
     Node,
+    SceneState,
 )
 from custom_components.bluetooth_mesh.btmesh.node import ReceivedMessage
 from custom_components.bluetooth_mesh.const import CONF_INVERTED_CTL, DOMAIN
@@ -1969,8 +1970,9 @@ async def test_a_nudge_is_read_back_once_the_wheel_stops(hass) -> None:
     async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=2))
     await hass.async_block_till_done()
 
-    read = sorted({call[1] for call in coordinator.calls if call[0] == "get_onoff"})
-    assert read == [0x0059, 0x00CE]
+    # A move on the control address changes the lightness only: read just that.
+    assert sorted(call[1] for call in coordinator.calls) == [0x0059, 0x00CE]
+    assert {call[0] for call in coordinator.calls} == {"get_lightness"}
 
 
 async def test_a_level_set_to_a_temperature_address_is_read_back(hass) -> None:
@@ -2011,3 +2013,58 @@ async def test_unloading_stops_hearing_the_remote(hass) -> None:
         unload()
 
     assert coordinator.group_message_listeners == []
+
+
+async def test_a_temperature_move_reads_only_the_temperature(hass) -> None:
+    added, coordinator = await _setup(hass, _tunable_white_group_network())
+    _, members = _group_and_members(added)
+    for member in members:
+        member.hass = hass
+        member._range_read = True
+    coordinator.ctl_temperature = 4100
+
+    coordinator.hear(_remote_set(TEMP_ADDR, "820c" "aa2a" "4b05" "00"))
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=2))
+    await hass.async_block_till_done()
+
+    assert {call[0] for call in coordinator.calls} == {"get_ctl_temperature"}
+    assert all(m.color_temp_kelvin == 4100 for m in members)
+
+
+def _scene_network() -> Network:
+    network = _tunable_white_group_network()
+    first, second = network.nodes
+    return replace(
+        network,
+        nodes=(
+            replace(first, scenes=(SceneState(number=1, lightness=0xFFFF, temperature=5000),)),
+            replace(second, scenes=(SceneState(number=1, lightness=0x8000, temperature=2700),)),
+        ),
+    )
+
+
+async def test_a_recalled_scene_shows_what_each_lamp_stores(hass) -> None:
+    """Scene A on the remote: no read, each lamp at its own stored values."""
+    added, coordinator = await _setup(hass, _scene_network())
+    _, members = _group_and_members(added)
+    by_unicast = {m.unique_id[-4:]: m for m in members}
+
+    coordinator.hear(_remote_set(CONTROL_ADDR, "8243" "0100" "09"))
+
+    assert coordinator.calls == []
+    assert (by_unicast["0059"].brightness, by_unicast["0059"].color_temp_kelvin) == (255, 5000)
+    assert (by_unicast["00ce"].brightness, by_unicast["00ce"].color_temp_kelvin) == (128, 2700)
+    assert all(m.is_on is True for m in members)
+
+
+async def test_a_scene_the_export_does_not_describe_is_read_back(hass) -> None:
+    added, coordinator = await _setup(hass, _scene_network())
+    _, members = _group_and_members(added)
+    for member in members:
+        member.hass = hass
+
+    coordinator.hear(_remote_set(CONTROL_ADDR, "8243" "0200" "0a"))
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=2))
+    await hass.async_block_till_done()
+
+    assert sorted({c[1] for c in coordinator.calls if c[0] == "get_onoff"}) == [0x0059, 0x00CE]

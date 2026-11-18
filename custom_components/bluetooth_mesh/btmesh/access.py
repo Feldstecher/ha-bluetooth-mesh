@@ -888,13 +888,15 @@ class ObservedSet(NamedTuple):
     ``exact`` is False for a Set that changes a lamp by an amount this side
     cannot know from the message alone — a Level delta or move, a scene
     recall — so the lamps must be read back; the value fields are then None.
-    Otherwise each field is what the Set states, or None where it says
-    nothing about that state.
+    For a scene recall ``scene`` names the scene, which a caller that knows
+    what each lamp stores for it can show instead. Otherwise each field is
+    what the Set states, or None where it says nothing about that state.
     """
 
     onoff: bool | None = None
     lightness: int | None = None
     temperature: int | None = None
+    scene: int | None = None
     exact: bool = True
 
 
@@ -905,8 +907,6 @@ _INEXACT_SETS = frozenset(
         OP_GENERIC_DELTA_SET_UNACK,
         OP_GENERIC_MOVE_SET,
         OP_GENERIC_MOVE_SET_UNACK,
-        OP_SCENE_RECALL,
-        OP_SCENE_RECALL_UNACK,
     }
 )
 
@@ -958,6 +958,9 @@ def observe_set(opcode: int, params: bytes) -> ObservedSet | None:
     if opcode in (OP_LIGHT_CTL_TEMPERATURE_SET, OP_LIGHT_CTL_TEMPERATURE_SET_UNACK):
         _need_params(opcode, params, 5)
         return ObservedSet(temperature=int.from_bytes(params[0:2], "little"))
+    if opcode in (OP_SCENE_RECALL, OP_SCENE_RECALL_UNACK):
+        _need_params(opcode, params, 3)
+        return ObservedSet(scene=int.from_bytes(params[0:2], "little"), exact=False)
     if opcode in _INEXACT_SETS:
         return ObservedSet(exact=False)
     return None

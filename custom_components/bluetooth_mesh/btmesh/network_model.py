@@ -36,6 +36,7 @@ __all__ = [
     "Model",
     "Element",
     "Node",
+    "SceneState",
     "Group",
     "Network",
 ]
@@ -117,6 +118,21 @@ class Element:
 
 
 @dataclass(frozen=True)
+class SceneState:
+    """What a node's lamp shows once a scene is recalled, per the export.
+
+    The vendor app stores each scene on every lamp (Scene Store) and keeps a
+    copy in ``tos_devices[].sceneSettings[].sceneValue``: lightness 0..65535,
+    then Kelvin. A remote recalling the scene says only its number, so this
+    copy is the one way to show the room without reading every lamp back.
+    """
+
+    number: int
+    lightness: int
+    temperature: int
+
+
+@dataclass(frozen=True)
 class Node:
     """A provisioned node described by the ``.connect`` composition.
 
@@ -130,6 +146,12 @@ class Node:
     cid: int
     name: str
     elements: tuple[Element, ...]
+    # Defaulted so a Node built by hand (tests, fixtures) stays valid.
+    scenes: tuple[SceneState, ...] = ()
+
+    def scene(self, number: int) -> SceneState | None:
+        """The stored state for scene ``number``, or None if the export has none."""
+        return next((s for s in self.scenes if s.number == number), None)
 
     def has_model(self, model_id: int) -> bool:
         """Whether any element of this node hosts ``model_id``."""
@@ -322,11 +344,12 @@ class Network:
         # another vendor's app, and a single node missing a field it never
         # promised (a provisioner record, a firmware quirk) used to make the
         # entire network unusable with no way to tell which one was at fault.
+        scene_numbers = _scene_numbers(data.get("tos_scenes"))
         nodes = []
         skipped: list[str] = []
         for raw_node in raw_nodes:
             try:
-                nodes.append(_parse_node(raw_node))
+                nodes.append(_parse_node(raw_node, scene_numbers))
             except NetworkModelError as exc:
                 name = (
                     raw_node.get("UUID", "?")
@@ -552,7 +575,61 @@ def _parse_element(
     )
 
 
-def _parse_node(raw: dict) -> Node:
+def _scene_numbers(entries: object) -> dict[str, int]:
+    """``tos_scenes[]`` as scene id → scene number; malformed entries skipped."""
+    if not isinstance(entries, list):
+        return {}
+    numbers = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        scene_id, number = entry.get("id"), entry.get("sceneNumber")
+        if isinstance(scene_id, str) and isinstance(number, int) and not isinstance(
+            number, bool
+        ):
+            numbers[scene_id] = number
+    return numbers
+
+
+def _parse_scenes(raw: dict, scene_numbers: dict[str, int]) -> tuple[SceneState, ...]:
+    """The scenes a node stores, from ``tos_devices[].sceneSettings``.
+
+    A node lists the controller and each lamp behind it as separate devices,
+    each with its own copy of the scenes. A scene is kept only when every copy
+    that names it agrees: on a box driving two strips the copies can differ,
+    and one value for the node would then be a guess. Like groups, this is
+    vendor sugar; a malformed entry is skipped, never raised over.
+    """
+    devices = raw.get("tos_devices")
+    if not isinstance(devices, list):
+        return ()
+    seen: dict[int, set[tuple[int, int]]] = {}
+    for device in devices:
+        settings = device.get("sceneSettings") if isinstance(device, dict) else None
+        if not isinstance(settings, list):
+            continue
+        for setting in settings:
+            if not isinstance(setting, dict):
+                continue
+            number = scene_numbers.get(setting.get("id"))
+            value = setting.get("sceneValue")
+            if (
+                number is None
+                or not isinstance(value, list)
+                or len(value) < 2
+                or not all(isinstance(v, int) and not isinstance(v, bool) for v in value[:2])
+                or not 0 <= value[0] <= 0xFFFF
+            ):
+                continue
+            seen.setdefault(number, set()).add((value[0], value[1]))
+    return tuple(
+        SceneState(number=number, lightness=values[0][0], temperature=values[0][1])
+        for number, values in sorted((n, sorted(v)) for n, v in seen.items())
+        if len(values) == 1
+    )
+
+
+def _parse_node(raw: dict, scene_numbers: dict[str, int] | None = None) -> Node:
     """Parse one ``nodes[]`` entry into a :class:`Node`."""
     if not isinstance(raw, dict):
         raise NetworkModelError("node entry is not an object")
@@ -573,4 +650,5 @@ def _parse_node(raw: dict) -> Node:
         cid=cid,
         name=_node_name(raw),
         elements=elements,
+        scenes=_parse_scenes(raw, scene_numbers or {}),
     )
