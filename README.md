@@ -83,6 +83,39 @@ The integration configures that filter, so:
   is otherwise invisible from the dashboard, which would keep asserting the
   state it asked for.
 
+A Häfele remote (or wall switch) commands a room with Sets to a group address,
+and a Häfele proxy forwards none of that traffic to its GATT client. To keep the
+room's state right, let an ESPHome Bluetooth proxy near the remote hand its
+Mesh Message adverts (AD type 0x2A) to Home Assistant as an event; the
+integration decrypts them and shows what the remote did:
+
+```yaml
+esp32_ble_tracker:
+  on_ble_advertise:
+    - mac_address: [C6:44:8A:8D:35:19]   # the remote's addresses
+      then:
+        - homeassistant.event:
+            event: esphome.bluetooth_mesh_pdu
+            data:
+              pdu: !lambda |-
+                const auto &r = x.get_scan_result();
+                std::string hex;
+                for (uint8_t i = 0; i + 1 < r.adv_data_len;) {
+                  uint8_t len = r.ble_adv[i];
+                  if (len == 0 || i + 1 + len > r.adv_data_len) break;
+                  if (r.ble_adv[i + 1] == 0x2A) {
+                    char buf[3];
+                    for (uint8_t j = i + 2; j < i + 1 + len; j++) {
+                      snprintf(buf, sizeof(buf), "%02x", r.ble_adv[j]);
+                      hex += buf;
+                    }
+                    break;
+                  }
+                  i += 1 + len;
+                }
+                return hex;
+```
+
 Some lamps map colour temperature the wrong way round: they glow warm white when
 Home Assistant says cool. Tick those under **Lamps with inverted colour
 temperature** (Settings → Devices & Services → *Bluetooth Mesh* → **Configure**)

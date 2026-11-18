@@ -67,11 +67,18 @@ class NodeError(BtMeshError):
 
 
 class ReceivedMessage(NamedTuple):
-    """A decrypted, parsed access message."""
+    """A decrypted, parsed access message.
+
+    ``dst`` is where it was sent: our own address for a reply, a group address
+    for a Set another client sent to a group the proxy forwards to us.
+    Defaulted to the unassigned address so a message built by hand (tests)
+    stays valid.
+    """
 
     src: int
     opcode: int
     params: bytes
+    dst: int = 0x0000
 
 
 def _seq_auth(seq: int, seq_zero: int) -> int:
@@ -449,7 +456,9 @@ class MeshNode:
         except AccessError as exc:
             logger.debug("unparseable access payload from %#06x: %s", pdu.src, exc)
             return
-        self._deliver(ReceivedMessage(src=pdu.src, opcode=opcode, params=params))
+        self._deliver(
+            ReceivedMessage(src=pdu.src, opcode=opcode, params=params, dst=pdu.dst)
+        )
 
     def _rx_key(self, akf: bool, aid: int, src: int) -> bytes | None:
         if akf:

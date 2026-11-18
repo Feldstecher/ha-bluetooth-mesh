@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
+from datetime import timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -24,7 +25,10 @@ pytest.importorskip("homeassistant")
 pytest.importorskip("pytest_homeassistant_custom_component")
 
 from homeassistant.components.light import ColorMode
+from homeassistant.util import dt as dt_util
+from pytest_homeassistant_custom_component.common import async_fire_time_changed
 
+from custom_components.bluetooth_mesh.btmesh.access import parse_access
 from custom_components.bluetooth_mesh.btmesh.network_model import (
     Element,
     Group,
@@ -32,6 +36,7 @@ from custom_components.bluetooth_mesh.btmesh.network_model import (
     Network,
     Node,
 )
+from custom_components.bluetooth_mesh.btmesh.node import ReceivedMessage
 from custom_components.bluetooth_mesh.const import CONF_INVERTED_CTL, DOMAIN
 from custom_components.bluetooth_mesh.light import (
     MeshGroupLight,
@@ -72,11 +77,22 @@ class FakeCoordinator:
         # Whether a group Set can leave (False = no link to send it on).
         self.group_link = True
         self.listeners: list = []
+        self.group_message_listeners: list = []
+        self.unloads: list = []
 
     def async_add_listener(self, callback_):
         """Mirror the real coordinator: notified on availability changes."""
         self.listeners.append(callback_)
         return lambda: self.listeners.remove(callback_)
+
+    def async_add_group_message_listener(self, listener):
+        self.group_message_listeners.append(listener)
+        return lambda: self.group_message_listeners.remove(listener)
+
+    def hear(self, message) -> None:
+        """A Set another client sent to a group, as an ESPHome proxy overhears it."""
+        for listener in list(self.group_message_listeners):
+            listener(message)
 
     def fire(self) -> None:
         for callback_ in list(self.listeners):
@@ -184,7 +200,13 @@ def _light(
 def _entry(coordinator: FakeCoordinator, options: dict | None = None):
     """A minimal config-entry stand-in: runtime data plus the stored options."""
     return type(
-        "Entry", (), {"runtime_data": coordinator, "options": options or {}}
+        "Entry",
+        (),
+        {
+            "runtime_data": coordinator,
+            "options": options or {},
+            "async_on_unload": lambda self, func: coordinator.unloads.append(func),
+        },
     )()
 
 
@@ -1875,3 +1897,117 @@ def test_a_lamp_is_still_not_polled() -> None:
     light, _ = _light()
 
     assert light.should_poll is False
+
+# The Häfele remote switches, dims and recolours a room by sending Sets to the
+# room's group addresses. The lamps obey and tell nobody: the Set itself,
+# overheard over the air by an ESPHome proxy, is the one trace of the change.
+
+REMOTE = 0x00B9
+
+
+def _remote_set(dst: int, payload_hex: str) -> ReceivedMessage:
+    opcode, params = parse_access(bytes.fromhex(payload_hex))
+    return ReceivedMessage(src=REMOTE, opcode=opcode, params=params, dst=dst)
+
+
+async def test_the_remote_switching_a_room_off_shows_every_lamp_off(hass) -> None:
+    added, coordinator = await _setup(hass, _tunable_white_group_network())
+    group, members = _group_and_members(added)
+    for member in members:
+        member._is_on, member._brightness = True, 128
+
+    coordinator.hear(_remote_set(CONTROL_ADDR, "820300" "05"))
+
+    assert all(m.is_on is False for m in members)
+    assert group.is_on is False
+    assert coordinator.calls == []  # nothing sent, nothing read
+
+
+async def test_the_remote_dimming_a_room_shows_the_brightness(hass) -> None:
+    added, coordinator = await _setup(hass, _tunable_white_group_network())
+    _, members = _group_and_members(added)
+
+    coordinator.hear(_remote_set(CONTROL_ADDR, "824d" "0080" "06"))
+
+    assert all(m.is_on is True and m.brightness == 128 for m in members)
+
+
+async def test_the_remote_recolouring_a_room_shows_the_temperature(hass) -> None:
+    added, coordinator = await _setup(hass, _tunable_white_group_network())
+    _, members = _group_and_members(added)
+    for member in members:
+        member._is_on, member._color_temp_kelvin = True, 2700
+
+    coordinator.hear(_remote_set(TEMP_ADDR, "8265" "8813" "0000" "07"))
+
+    assert all(m.color_temp_kelvin == 5000 and m.is_on is True for m in members)
+
+
+async def test_a_set_to_a_group_no_light_hears_changes_nothing(hass) -> None:
+    added, coordinator = await _setup(hass, _tunable_white_group_network())
+    _, members = _group_and_members(added)
+    for member in members:
+        member._is_on = True
+
+    coordinator.hear(_remote_set(0xC0FF, "820300" "05"))
+
+    assert all(m.is_on is True for m in members)
+
+
+async def test_a_nudge_is_read_back_once_the_wheel_stops(hass) -> None:
+    """A Level delta says by how much, not to what: read the lamps back, once."""
+    added, coordinator = await _setup(hass, _tunable_white_group_network())
+    _, members = _group_and_members(added)
+    for member in members:
+        member.hass = hass
+
+    coordinator.hear(_remote_set(CONTROL_ADDR, "820a" "00100000" "08"))
+    coordinator.hear(_remote_set(CONTROL_ADDR, "820a" "00100000" "09"))
+    await hass.async_block_till_done()
+    assert coordinator.calls == []  # still turning
+
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=2))
+    await hass.async_block_till_done()
+
+    read = sorted({call[1] for call in coordinator.calls if call[0] == "get_onoff"})
+    assert read == [0x0059, 0x00CE]
+
+
+async def test_a_level_set_to_a_temperature_address_is_read_back(hass) -> None:
+    """There a Level is a temperature, which observe_set cannot name."""
+    added, coordinator = await _setup(hass, _tunable_white_group_network())
+    _, members = _group_and_members(added)
+    for member in members:
+        member.hass = hass
+        member._is_on, member._color_temp_kelvin = True, 2700
+
+    coordinator.ctl_temperature = 3500  # what the lamps report when read
+    coordinator.hear(_remote_set(TEMP_ADDR, "8207" "0000" "0a"))
+
+    # Not guessed: read as a lightness, level 0 would have meant "half on".
+    assert all(m.color_temp_kelvin == 2700 and m.is_on is True for m in members)
+
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=2))
+    await hass.async_block_till_done()
+
+    assert all(m.color_temp_kelvin == 3500 for m in members)
+
+
+async def test_a_relay_ignores_a_lightness_it_has_no_server_for(hass) -> None:
+    added, coordinator = await _setup(hass, _mixed_group_network())
+    _, members = _group_and_members(added)
+    relay = next(m for m in members if m.color_mode is ColorMode.ONOFF)
+    relay._is_on = False
+
+    coordinator.hear(_remote_set(GROUP_ADDR, "824d" "ffff" "0b"))
+
+    assert relay.is_on is False
+
+
+async def test_unloading_stops_hearing_the_remote(hass) -> None:
+    _, coordinator = await _setup(hass, _tunable_white_group_network())
+
+    for unload in coordinator.unloads:
+        unload()
+
+    assert coordinator.group_message_listeners == []

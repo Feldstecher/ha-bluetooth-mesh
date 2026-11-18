@@ -40,6 +40,14 @@ __all__ = [
     "OP_LIGHT_CTL_TEMPERATURE_SET",
     "OP_LIGHT_CTL_TEMPERATURE_SET_UNACK",
     "OP_LIGHT_CTL_TEMPERATURE_STATUS",
+    "OP_GENERIC_LEVEL_SET",
+    "OP_GENERIC_LEVEL_SET_UNACK",
+    "OP_GENERIC_DELTA_SET",
+    "OP_GENERIC_DELTA_SET_UNACK",
+    "OP_GENERIC_MOVE_SET",
+    "OP_GENERIC_MOVE_SET_UNACK",
+    "OP_SCENE_RECALL",
+    "OP_SCENE_RECALL_UNACK",
     "OP_ATTENTION_GET",
     "OP_ATTENTION_STATUS",
     "OP_NODE_RESET",
@@ -69,6 +77,7 @@ __all__ = [
     "LightCtlTemperatureRangeStatus",
     "CompositionElement",
     "CompositionData",
+    "ObservedSet",
     # Codec
     "encode_opcode",
     "parse_access",
@@ -100,6 +109,7 @@ __all__ = [
     "parse_light_ctl_temperature_status",
     "parse_light_ctl_temperature_range_status",
     "parse_composition_data_status",
+    "observe_set",
     "RelayStatus",
     "config_relay_get",
     "parse_config_relay_status",
@@ -138,6 +148,17 @@ OP_LIGHT_CTL_TEMPERATURE_RANGE_STATUS = 0x8263
 OP_LIGHT_CTL_TEMPERATURE_SET = 0x8264
 OP_LIGHT_CTL_TEMPERATURE_SET_UNACK = 0x8265
 OP_LIGHT_CTL_TEMPERATURE_STATUS = 0x8266
+# Generic Level and Scene opcodes (Mesh Model spec §7.1). Only ever decoded
+# here, from Sets another client sends (see :func:`observe_set`); this stack
+# does not send them.
+OP_GENERIC_LEVEL_SET = 0x8206
+OP_GENERIC_LEVEL_SET_UNACK = 0x8207
+OP_GENERIC_DELTA_SET = 0x8209
+OP_GENERIC_DELTA_SET_UNACK = 0x820A
+OP_GENERIC_MOVE_SET = 0x820B
+OP_GENERIC_MOVE_SET_UNACK = 0x820C
+OP_SCENE_RECALL = 0x8242
+OP_SCENE_RECALL_UNACK = 0x8243
 # Valid CTL temperature range in Kelvin (Mesh Model spec §6.1.3.1).
 _CTL_TEMP_MIN = 0x0320  # 800 K
 _CTL_TEMP_MAX = 0x4E20  # 20000 K
@@ -859,3 +880,84 @@ def parse_composition_data_status(payload: bytes) -> CompositionData:
         page=page, cid=cid, pid=pid, vid=vid, crpl=crpl,
         features=features, elements=tuple(elements),
     )
+
+
+class ObservedSet(NamedTuple):
+    """What a Set another client sent says about the lamps that receive it.
+
+    ``exact`` is False for a Set that changes a lamp by an amount this side
+    cannot know from the message alone — a Level delta or move, a scene
+    recall — so the lamps must be read back; the value fields are then None.
+    Otherwise each field is what the Set states, or None where it says
+    nothing about that state.
+    """
+
+    onoff: bool | None = None
+    lightness: int | None = None
+    temperature: int | None = None
+    exact: bool = True
+
+
+# Sets that change a lamp by an amount the message does not carry.
+_INEXACT_SETS = frozenset(
+    {
+        OP_GENERIC_DELTA_SET,
+        OP_GENERIC_DELTA_SET_UNACK,
+        OP_GENERIC_MOVE_SET,
+        OP_GENERIC_MOVE_SET_UNACK,
+        OP_SCENE_RECALL,
+        OP_SCENE_RECALL_UNACK,
+    }
+)
+
+
+def _need_params(opcode: int, params: bytes, minimum: int) -> None:
+    """Reject a Set shorter than its mandatory fields (longer is fine)."""
+    if len(params) < minimum:
+        raise AccessError(
+            f"opcode {_format_opcode(opcode)} needs at least {minimum} "
+            f"parameter bytes, got {len(params)}"
+        )
+
+
+def observe_set(opcode: int, params: bytes) -> ObservedSet | None:
+    """Decode a lighting Set ANOTHER client sent, for the state it implies.
+
+    The decoders above read the Statuses a lamp sends us. A remote or wall
+    switch that commands a group sends Sets instead, and a lamp acting on one
+    of those sends us nothing: this is how its new state can be known without
+    reading every lamp back.
+
+    ``None`` for anything that is not such a Set (Gets, Statuses, vendor and
+    Foundation traffic). A Set too short for its mandatory fields raises
+    :class:`AccessError`; optional transition/delay octets are ignored, since
+    only the target state matters here.
+
+    A Generic Level Set is read as Light Lightness Actual, through the binding
+    Light Lightness Actual = Generic Level + 32768 (Mesh Model spec §6.1.2.2.2).
+    That holds for a Level server on the element hosting Light Lightness; on a
+    Temperature element the same Level means a temperature instead, which the
+    caller must tell apart by the address the Set went to.
+    """
+    if opcode in (OP_GENERIC_ONOFF_SET, OP_GENERIC_ONOFF_SET_UNACK):
+        _need_params(opcode, params, 2)
+        return ObservedSet(onoff=bool(params[0]))
+    if opcode in (OP_LIGHT_LIGHTNESS_SET, OP_LIGHT_LIGHTNESS_SET_UNACK):
+        _need_params(opcode, params, 3)
+        return ObservedSet(lightness=int.from_bytes(params[0:2], "little"))
+    if opcode in (OP_GENERIC_LEVEL_SET, OP_GENERIC_LEVEL_SET_UNACK):
+        _need_params(opcode, params, 3)
+        level = int.from_bytes(params[0:2], "little", signed=True)
+        return ObservedSet(lightness=level + 32768)
+    if opcode in (OP_LIGHT_CTL_SET, OP_LIGHT_CTL_SET_UNACK):
+        _need_params(opcode, params, 7)
+        return ObservedSet(
+            lightness=int.from_bytes(params[0:2], "little"),
+            temperature=int.from_bytes(params[2:4], "little"),
+        )
+    if opcode in (OP_LIGHT_CTL_TEMPERATURE_SET, OP_LIGHT_CTL_TEMPERATURE_SET_UNACK):
+        _need_params(opcode, params, 5)
+        return ObservedSet(temperature=int.from_bytes(params[0:2], "little"))
+    if opcode in _INEXACT_SETS:
+        return ObservedSet(exact=False)
+    return None

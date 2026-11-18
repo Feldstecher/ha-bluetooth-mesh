@@ -31,13 +31,19 @@ from homeassistant.helpers.storage import Store
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.bluetooth_mesh import coordinator as coordinator_mod
+from custom_components.bluetooth_mesh.btmesh.access import (
+    OP_GENERIC_ONOFF_SET_UNACK,
+    generic_onoff_set,
+)
 from custom_components.bluetooth_mesh.btmesh.fanout import FanoutBearer
+from custom_components.bluetooth_mesh.btmesh.node import MeshNode
 from custom_components.bluetooth_mesh.const import (
     CONF_ALL_PROXIES,
     CONF_CONNECT_JSON,
     CONF_KEEPALIVE,
     CONF_SRC_ADDR,
     DOMAIN,
+    EVENT_MESH_PDU,
 )
 from custom_components.bluetooth_mesh.coordinator import (
     SEQ_SAFETY_MARGIN,
@@ -2747,3 +2753,115 @@ async def test_lamps_are_re_read_when_a_node_joins_late(hass) -> None:
         # Notified once the node is part of the held links, not before.
         assert notified == [[PROXY_ADDR, OTHER_PROXY_ADDR]]
     await coord.async_stop()
+
+
+# A Häfele proxy forwards no mesh traffic to its GATT client, so a room
+# switched from the remote is only seen through the Mesh Message adverts an
+# ESPHome proxy overhears, handed over as an event.
+
+
+def _overheard(coord, dst: int, payload: bytes, *, src: int = 0x00B9) -> str:
+    """The network PDU a node at ``src`` broadcasts for ``payload``, as hex."""
+    sent: list[bytes] = []
+    remote = MeshNode(
+        netkey=coord.network.net_key,
+        appkey=coord._app_key.key,
+        iv_index=coord.iv_index,
+        src_addr=src,
+        send_network_pdu=sent.append,
+        seq=0x40,
+    )
+    remote.send_access(dst, payload)
+    return sent[-1].hex()
+
+
+async def _started(hass, fake):
+    coord = MeshCoordinator(hass, _make_entry(hass))
+    await coord.async_start()
+    heard: list = []
+    coord.async_add_group_message_listener(heard.append)
+    return coord, heard
+
+
+async def test_an_overheard_group_set_reaches_the_listeners(hass) -> None:
+    fake = FakeController()
+    with _patch_transport(fake):
+        coord, heard = await _started(hass, fake)
+        broken_calls: list = []
+
+        def broken(message) -> None:
+            broken_calls.append(message)
+            raise RuntimeError("one listener failing")
+
+        coord.async_add_group_message_listener(broken)
+        pdu = _overheard(coord, 0xC001, generic_onoff_set(False, 0x05, ack=False))
+
+        hass.bus.async_fire(EVENT_MESH_PDU, {"pdu": pdu})
+        await hass.async_block_till_done()
+        # The same PDU relayed by another box: the same (src, seq), heard once.
+        hass.bus.async_fire(EVENT_MESH_PDU, {"pdu": pdu})
+        await hass.async_block_till_done()
+
+        assert [(m.src, m.dst, m.opcode, m.params) for m in heard] == [
+            (0x00B9, 0xC001, OP_GENERIC_ONOFF_SET_UNACK, b"\x00\x05")
+        ]
+        assert len(broken_calls) == 1
+    await coord.async_stop()
+
+
+async def test_an_overheard_set_to_a_unicast_is_not_passed_on(hass) -> None:
+    fake = FakeController()
+    with _patch_transport(fake):
+        coord, heard = await _started(hass, fake)
+        pdu = _overheard(coord, 0x0059, generic_onoff_set(True, 0x06, ack=False))
+
+        hass.bus.async_fire(EVENT_MESH_PDU, {"pdu": pdu})
+        await hass.async_block_till_done()
+
+        assert heard == []
+    await coord.async_stop()
+
+
+async def test_our_own_group_set_heard_again_is_an_echo(hass) -> None:
+    fake = FakeController()
+    with _patch_transport(fake):
+        coord, heard = await _started(hass, fake)
+        pdu = _overheard(
+            coord, 0xC001, generic_onoff_set(True, 0x07, ack=False), src=coord.src_addr
+        )
+
+        hass.bus.async_fire(EVENT_MESH_PDU, {"pdu": pdu})
+        await hass.async_block_till_done()
+
+        assert heard == []
+    await coord.async_stop()
+
+
+@pytest.mark.parametrize(
+    "data",
+    [{}, {"pdu": ""}, {"pdu": 42}, {"pdu": "zz"}, {"pdu": "00" * 30}, {"pdu": "00" * 20}],
+)
+async def test_a_bad_overheard_pdu_is_dropped(hass, data) -> None:
+    """Any ESPHome device can fire the event: nothing in it is trusted."""
+    fake = FakeController()
+    with _patch_transport(fake):
+        coord, heard = await _started(hass, fake)
+
+        hass.bus.async_fire(EVENT_MESH_PDU, data)
+        await hass.async_block_till_done()
+
+        assert heard == []
+    await coord.async_stop()
+
+
+async def test_nothing_is_heard_after_stop(hass) -> None:
+    fake = FakeController()
+    with _patch_transport(fake):
+        coord, heard = await _started(hass, fake)
+        pdu = _overheard(coord, 0xC001, generic_onoff_set(False, 0x08, ack=False))
+        await coord.async_stop()
+
+        hass.bus.async_fire(EVENT_MESH_PDU, {"pdu": pdu})
+        await hass.async_block_till_done()
+
+        assert heard == []

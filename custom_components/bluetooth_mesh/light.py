@@ -38,11 +38,14 @@ from homeassistant.components.light import (
     ColorMode,
     LightEntity,
 )
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.event import async_call_later
 
 from . import BluetoothMeshConfigEntry
+from .btmesh.access import AccessError, ObservedSet, observe_set
+from .btmesh.node import ReceivedMessage
 from .const import (
     CONF_INVERTED_CTL,
     DOMAIN,
@@ -54,6 +57,12 @@ from .const import (
 from .coordinator import MeshCoordinator
 
 logger = logging.getLogger(__name__)
+
+# How long after the last Set that left a lamp's state unknown (a dimming
+# wheel's Level deltas, a scene recall) the lamps it reached are read back.
+# A wheel turned sends one delta after another; reading after each would queue
+# a read of every lamp in the room behind every step.
+OBSERVED_REFRESH_DELAY = 1.5
 
 # HA brightness is a 0..255 byte; mesh Lightness/CTL are 16-bit 0..65535.
 MESH_LEVEL_MAX = 0xFFFF
@@ -243,6 +252,89 @@ async def async_setup_entry(
             )
 
     async_add_entities(entities)
+
+    # Who hears what: a Set another client sends to a group reaches every
+    # element subscribed to it, and that is exactly the set of lights whose
+    # state it changes.
+    control: dict[int, list[MeshLight]] = {}
+    temperature: dict[int, list[MeshLight]] = {}
+    for light, element in outputs_by_light:
+        for address in {a for model in element.models for a in model.subscribe}:
+            control.setdefault(address, []).append(light)
+        temp_element = light.ctl_temp_element
+        if temp_element is not None and temp_element is not element:
+            for address in {a for model in temp_element.models for a in model.subscribe}:
+                temperature.setdefault(address, []).append(light)
+    router = _ObservedSetRouter(hass, control, temperature)
+    entry.async_on_unload(coordinator.async_add_group_message_listener(router))
+    entry.async_on_unload(router.async_cancel)
+
+
+class _ObservedSetRouter:
+    """Apply a Set another client sent to a group to the lights it reached.
+
+    The Häfele remote switches, dims and recolours a room by sending Sets to
+    the room's group addresses. The lamps obey and tell nobody, so until
+    2026-11 Home Assistant kept showing a room the remote had switched off as
+    lit. The Set itself, overheard over the air by an ESPHome proxy (see
+    :meth:`MeshCoordinator._on_overheard_pdu`), is the one trace of the change.
+
+    A Set naming the new state is applied at once. One that only nudges it (a
+    Level delta from the remote's wheel, a scene recall) cannot be, so the
+    lamps it reached are read back once the nudging stops.
+    """
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        control: dict[int, list[MeshLight]],
+        temperature: dict[int, list[MeshLight]],
+    ) -> None:
+        self._hass = hass
+        self._control = control
+        self._temperature = temperature
+        self._stale: set[MeshLight] = set()
+        self._cancel_refresh: CALLBACK_TYPE | None = None
+
+    @callback
+    def __call__(self, message: ReceivedMessage) -> None:
+        try:
+            observed = observe_set(message.opcode, message.params)
+        except AccessError as exc:
+            logger.debug("malformed Set from %#06x: %s", message.src, exc)
+            return
+        if observed is None:
+            return
+        for light in self._control.get(message.dst, ()):
+            if observed.exact:
+                light.apply_observed_set(observed)
+            else:
+                self._stale.add(light)
+        for light in self._temperature.get(message.dst, ()):
+            # A Temperature element reads a Level Set as a temperature, not a
+            # lightness, so only a Set that names a temperature is exact here.
+            if observed.exact and observed.temperature is not None:
+                light.apply_observed_set(ObservedSet(temperature=observed.temperature))
+            else:
+                self._stale.add(light)
+        if self._stale:
+            self.async_cancel()
+            self._cancel_refresh = async_call_later(
+                self._hass, OBSERVED_REFRESH_DELAY, self._refresh
+            )
+
+    @callback
+    def _refresh(self, _now) -> None:
+        self._cancel_refresh = None
+        stale, self._stale = self._stale, set()
+        for light in stale:
+            light.schedule_refresh()
+
+    @callback
+    def async_cancel(self) -> None:
+        if self._cancel_refresh is not None:
+            self._cancel_refresh()
+            self._cancel_refresh = None
 
 
 class MeshLight(LightEntity):
@@ -703,6 +795,32 @@ class MeshLight(LightEntity):
                 self.max_color_temp_kelvin, max(self.min_color_temp_kelvin, kelvin)
             )
         self._write_state()
+
+    def apply_observed_set(self, observed: ObservedSet) -> None:
+        """Reflect a Set another client sent to a group this light hears.
+
+        Shown like a group command of our own (:meth:`apply_group_state`),
+        since that is what it is: one unacknowledged Set to every member. A
+        lightness reaches only a lamp with a Lightness server, and a
+        temperature only a tunable-white one; a relay hearing either ignores it.
+        """
+        dims = self.color_mode is not ColorMode.ONOFF
+        on, brightness, kelvin = self._is_on, None, None
+        if observed.lightness is not None and dims:
+            on = observed.lightness > 0
+            if on:
+                brightness = max(1, self._level_to_brightness(observed.lightness))
+        elif observed.onoff is not None:
+            on = observed.onoff
+        if observed.temperature is not None and self.color_mode is ColorMode.COLOR_TEMP:
+            kelvin = self._ha_kelvin(observed.temperature)
+        if (on, brightness, kelvin) == (self._is_on, None, None):
+            return
+        self.apply_group_state(on, brightness, kelvin)
+
+    def schedule_refresh(self) -> None:
+        """Read the lamp back in the background (see :meth:`_schedule_refresh`)."""
+        self._schedule_refresh()
 
     def group_snapshot(self) -> tuple[bool | None, int | None, int | None]:
         """What this light shows, so a group can put it back."""

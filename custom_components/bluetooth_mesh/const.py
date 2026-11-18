@@ -4,6 +4,16 @@ from __future__ import annotations
 
 DOMAIN = "bluetooth_mesh"
 
+# Home Assistant event carrying one mesh network PDU an ESPHome Bluetooth
+# proxy heard over the air (the payload of a Mesh Message advert, AD type
+# 0x2A, as hex in ``pdu``). ESPHome may only fire events under ``esphome.``.
+# A Häfele proxy node forwards none of the mesh traffic to its GATT client, so
+# this is the only way the Set a remote sends to a room reaches us; see the
+# README for the ESPHome snippet that fires it.
+EVENT_MESH_PDU = "esphome.bluetooth_mesh_pdu"
+# The longest network PDU a Mesh Message advert can carry (spec §3.3.1).
+MAX_NETWORK_PDU_LEN = 29
+
 # Raw ``.connect`` network export JSON, stored verbatim in the config entry.
 # The runtime (B3) re-parses it via ``Network.from_connect`` at setup time.
 CONF_CONNECT_JSON = "connect_json"

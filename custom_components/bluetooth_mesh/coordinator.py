@@ -36,6 +36,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections.abc import Callable
 from datetime import timedelta
 from time import monotonic
 
@@ -48,6 +49,7 @@ from .btmesh.controller import MeshController
 from .btmesh.crypto import k3
 from .btmesh.fanout import FanoutBearer
 from .btmesh.network_model import UNICAST_MAX, UNICAST_MIN, Network
+from .btmesh.node import MeshNode, ReceivedMessage
 from .const import (
     CONF_ALL_PROXIES,
     CONF_CONNECT_JSON,
@@ -58,6 +60,8 @@ from .const import (
     DEFAULT_KEEPALIVE,
     DEFAULT_SRC_ADDR,
     DOMAIN,
+    EVENT_MESH_PDU,
+    MAX_NETWORK_PDU_LEN,
 )
 from .mesh_transport import (
     PROXY_ADVERT_MAX_AGE,
@@ -82,6 +86,10 @@ __all__ = ["MeshCoordinator"]
 # sharing a unicast with a real node means that node's peers already hold a
 # replay-protection entry for it and discard everything we send.
 SRC_ADDR = 0x7FFF
+# The dynamically assignable group range (spec §3.4.2.4): where a remote or a
+# wall switch sends the Set that commands a room.
+GROUP_ADDRESS_MIN = 0xC000
+GROUP_ADDRESS_MAX = 0xFEFF
 
 # Consecutive failed connect attempts before we surface the proxy_unreachable
 # repair issue. A transient miss (proxy momentarily off the discovery snapshot)
@@ -297,6 +305,14 @@ class MeshCoordinator:
         self._discovery_unsub: CALLBACK_TYPE | None = None
         # Entities subscribed to availability transitions (see async_add_listener).
         self._listeners: list[CALLBACK_TYPE] = []
+        # Told about every message another client sends to a group (see
+        # async_add_group_message_listener).
+        self._group_message_listeners: list[Callable[[ReceivedMessage], None]] = []
+        # Receive-only node decrypting what ESPHome proxies overhear (see
+        # _on_overheard_pdu), and the IV Index it was built for.
+        self._overhear_node: MeshNode | None = None
+        self._overhear_iv: int | None = None
+        self._overhear_unsub: CALLBACK_TYPE | None = None
         # The HELD proxy connection (keep-alive): reused across commands and
         # dropped after _idle_timeout seconds of inactivity (0 = never drop).
         # None while disconnected.
@@ -436,6 +452,79 @@ class MeshCoordinator:
 
         return _remove
 
+    def async_add_group_message_listener(
+        self, listener: Callable[[ReceivedMessage], None]
+    ) -> CALLBACK_TYPE:
+        """Subscribe to Sets other clients send to a group; returns the remover.
+
+        A room switched from the Häfele remote arrives here as the remote's own
+        Set, overheard over the air by an ESPHome proxy (see
+        :meth:`_on_overheard_pdu`). The lamps that obey it send nothing back,
+        and without this Home Assistant went on showing them as they were.
+        """
+        self._group_message_listeners.append(listener)
+
+        def _remove() -> None:
+            if listener in self._group_message_listeners:
+                self._group_message_listeners.remove(listener)
+
+        return _remove
+
+    @callback
+    def _on_group_message(self, message: ReceivedMessage) -> None:
+        """Fan a group message out; one listener raising must not starve another."""
+        logger.debug(
+            "heard opcode %#06x from %#06x to group %#06x: %s",
+            message.opcode, message.src, message.dst, message.params.hex(),
+        )
+        for listener in list(self._group_message_listeners):
+            try:
+                listener(message)
+            except Exception:  # noqa: BLE001
+                logger.exception("group message listener raised")
+
+    @callback
+    def _on_overheard_pdu(self, event) -> None:
+        """Decrypt a network PDU an ESPHome proxy heard, and pass a group Set on.
+
+        The event can come from any ESPHome device, so its payload is checked
+        before anything is decoded, and whatever does not decrypt with this
+        network's keys is dropped by the node in silence: it is another
+        network's, or noise. The node never transmits, and it shares our source
+        address so that our own group Sets, heard again as relays rebroadcast
+        them, are dropped as echoes instead of being applied a second time.
+        """
+        pdu_hex = event.data.get("pdu")
+        if not isinstance(pdu_hex, str) or not pdu_hex:
+            return
+        try:
+            pdu = bytes.fromhex(pdu_hex)
+        except ValueError:
+            logger.debug("ignoring a mesh PDU that is not hex: %r", pdu_hex[:80])
+            return
+        if len(pdu) > MAX_NETWORK_PDU_LEN:
+            logger.debug("ignoring a %d-byte mesh PDU, too long", len(pdu))
+            return
+        if self._overhear_node is None or self._overhear_iv != self._iv_index:
+            # Built lazily and again after an IV Index update: the node
+            # decrypts with the IV Index it was given.
+            self._overhear_iv = self._iv_index
+            self._overhear_node = MeshNode(
+                netkey=self._network.net_key,
+                appkey=self._app_key.key,
+                iv_index=self._iv_index,
+                src_addr=self._src_addr,
+                send_network_pdu=lambda _raw: None,
+            )
+            self._overhear_node.on_message = self._on_overheard_message
+        self._overhear_node.handle_network_pdu(pdu)
+
+    @callback
+    def _on_overheard_message(self, message: ReceivedMessage) -> None:
+        """Only a message to a group says something about a room."""
+        if GROUP_ADDRESS_MIN <= message.dst <= GROUP_ADDRESS_MAX:
+            self._on_group_message(message)
+
     def _notify_listeners(self) -> None:
         """Fire every listener; one raising must not starve the others."""
         for update_callback in list(self._listeners):
@@ -530,6 +619,9 @@ class MeshCoordinator:
         self._discovery_unsub = async_register_proxy_callback(
             self.hass, self._network.net_key, self._on_proxy_seen
         )
+        self._overhear_unsub = self.hass.bus.async_listen(
+            EVENT_MESH_PDU, self._on_overheard_pdu
+        )
 
     async def async_stop(self) -> None:
         """Cancel timers, drop the held connection, and clear the repair issue."""
@@ -540,6 +632,10 @@ class MeshCoordinator:
         if self._discovery_unsub is not None:
             self._discovery_unsub()
             self._discovery_unsub = None
+        if self._overhear_unsub is not None:
+            self._overhear_unsub()
+            self._overhear_unsub = None
+        self._overhear_node = None
         async with self._lock:
             await self._teardown()
         # Flush the debounced cursor now: the entry is going away, and a SEQ

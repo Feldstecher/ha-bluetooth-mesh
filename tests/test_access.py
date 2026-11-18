@@ -23,11 +23,13 @@ from btmesh.access import (
     AppKeyStatus,
     GenericOnOffStatus,
     ModelAppStatus,
+    ObservedSet,
     config_appkey_add,
     config_composition_data_get,
     config_model_app_bind,
     generic_onoff_get,
     generic_onoff_set,
+    observe_set,
     parse_access,
     parse_config_appkey_status,
     parse_config_model_app_status,
@@ -521,3 +523,49 @@ def test_parse_light_ctl_temperature_range_status_rejects_a_wrong_length():
 
     with pytest.raises(AccessError):
         parse_light_ctl_temperature_range_status(bytes.fromhex("8263" "00" "2003"))
+
+
+# --------------------------------------------------- Sets of other clients
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        # Generic OnOff Set Unack, off, TID 5
+        ("820300" "05", ObservedSet(onoff=False)),
+        # Generic OnOff Set, on, TID 5, transition + delay
+        ("820201" "05" "0000", ObservedSet(onoff=True)),
+        # Light Lightness Set Unack 0x8000
+        ("824d0080" "07", ObservedSet(lightness=0x8000)),
+        # Generic Level Set Unack, level 0 -> lightness 32768
+        ("82070000" "08", ObservedSet(lightness=32768)),
+        # Generic Level Set, level -32768 -> lightness 0
+        ("82060080" "08", ObservedSet(lightness=0)),
+        # Light CTL Set Unack: lightness 0xFFFF, 2700 K, delta UV 0
+        ("825fffff" "8c0a" "0000" "09", ObservedSet(lightness=0xFFFF, temperature=2700)),
+        # Light CTL Temperature Set Unack: 5000 K
+        ("8265" "8813" "0000" "0a", ObservedSet(temperature=5000)),
+        # Generic Delta Set Unack: amount unknown here
+        ("820a" "00100000" "0b", ObservedSet(exact=False)),
+        # Scene Recall Unack, scene 1
+        ("8243" "0100" "0c", ObservedSet(exact=False)),
+    ],
+)
+def test_observe_set_reads_the_state_a_set_implies(payload, expected):
+    opcode, params = parse_access(bytes.fromhex(payload))
+
+    assert observe_set(opcode, params) == expected
+
+
+def test_observe_set_ignores_what_is_not_a_lighting_set():
+    # A Generic OnOff Status, and a Light Lightness Get.
+    for payload in ("820401", "824b"):
+        opcode, params = parse_access(bytes.fromhex(payload))
+        assert observe_set(opcode, params) is None
+
+
+def test_observe_set_rejects_a_set_shorter_than_its_fields():
+    opcode, params = parse_access(bytes.fromhex("8265" "8813"))
+
+    with pytest.raises(AccessError):
+        observe_set(opcode, params)
